@@ -36,7 +36,7 @@ No CSV or NPZ conversion is used.
 
 1) Install dependencies
 
-pip install tensorflow matplotlib numpy
+pip install -r requirements.txt
 
 2) Train and generate all artifacts
 
@@ -53,6 +53,34 @@ Optional (faster steady-state, but may print extra XLA/cuDNN autotuning warnings
 
 python train_ae_vae.py --data_root data --output_dir outputs --jit_compile --memory_growth
 
+## MLflow Tracking
+
+Enable MLflow tracking (local by default, creates mlruns/):
+
+python train_ae_vae.py \
+  --data_root data \
+  --output_dir outputs \
+  --image_size 128 \
+  --channels 1 \
+  --batch_size 8 \
+  --epochs 10 \
+  --memory_growth \
+  --enable_mlflow \
+  --mlflow_experiment AE_VAE_Representation_Learning \
+  --mlflow_run_name run_bs8_e10
+
+Use a remote tracking server by adding:
+
+--mlflow_tracking_uri http://127.0.0.1:5000
+
+What gets logged:
+
+- Training configuration parameters
+- Dataset split sizes
+- AE and VAE per-epoch metrics
+- AE and VAE test metrics
+- Saved model weights and plots as artifacts
+
 ## Google Drive / Colab Run
 
 1) Upload the project and dataset folders to Google Drive
@@ -64,16 +92,16 @@ python train_ae_vae.py --data_root /content/drive/MyDrive/your_project/data
 
 ## Outputs
 
-After training, artifacts are saved under outputs/:
+After training, artifacts are saved under a unique run directory to avoid overwriting:
 
-- outputs/models/ae.weights.h5
-- outputs/models/vae.weights.h5
-- outputs/plots/ae_training_curves.png
-- outputs/plots/vae_training_curves.png
-- outputs/plots/ae_reconstructions.png
-- outputs/plots/vae_reconstructions.png
-- outputs/plots/ae_denoising.png
-- outputs/plots/vae_denoising.png
-- outputs/plots/vae_generated_samples.png
-- outputs/plots/ae_latent_scatter.png
-- outputs/plots/vae_latent_scatter.png
+- outputs/runs/<timestamp>_<run_name_or_run_id>/models/ae.weights.h5
+- outputs/runs/<timestamp>_<run_name_or_run_id>/models/vae.weights.h5
+- outputs/runs/<timestamp>_<run_name_or_run_id>/plots/ae_training_curves.png
+- outputs/runs/<timestamp>_<run_name_or_run_id>/plots/vae_training_curves.png
+- outputs/runs/<timestamp>_<run_name_or_run_id>/plots/ae_reconstructions.png
+- outputs/runs/<timestamp>_<run_name_or_run_id>/plots/vae_reconstructions.png
+- outputs/runs/<timestamp>_<run_name_or_run_id>/plots/ae_denoising.png
+- outputs/runs/<timestamp>_<run_name_or_run_id>/plots/vae_denoising.png
+- outputs/runs/<timestamp>_<run_name_or_run_id>/plots/vae_generated_samples.png
+- outputs/runs/<timestamp>_<run_name_or_run_id>/plots/ae_latent_scatter.png
+- outputs/runs/<timestamp>_<run_name_or_run_id>/plots/vae_latent_scatter.png

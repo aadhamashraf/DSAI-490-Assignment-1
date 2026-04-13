@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import tensorflow as tf
@@ -47,7 +49,49 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable GPU memory growth to avoid grabbing all GPU memory at once.",
     )
+    parser.add_argument(
+        "--enable_mlflow",
+        action="store_true",
+        help="Enable MLflow experiment tracking.",
+    )
+    parser.add_argument(
+        "--mlflow_tracking_uri",
+        type=str,
+        default="",
+        help="MLflow tracking URI. Leave empty to use default local mlruns directory.",
+    )
+    parser.add_argument(
+        "--mlflow_experiment",
+        type=str,
+        default="AE_VAE_Representation_Learning",
+        help="MLflow experiment name.",
+    )
+    parser.add_argument(
+        "--mlflow_run_name",
+        type=str,
+        default="",
+        help="Optional MLflow run name.",
+    )
     return parser.parse_args()
+
+
+def _log_history_metrics(
+    mlflow_module: Any,
+    model_name: str,
+    history: dict[str, list[float]],
+) -> None:
+    if not history:
+        return
+
+    max_epochs = max(len(values) for values in history.values() if isinstance(values, list))
+    for epoch in range(max_epochs):
+        for metric_name, values in history.items():
+            if epoch < len(values):
+                mlflow_module.log_metric(
+                    f"{model_name}_{metric_name}",
+                    float(values[epoch]),
+                    step=epoch,
+                )
 
 
 def build_latent_arrays(
@@ -77,6 +121,26 @@ def build_latent_arrays(
 def main() -> None:
     args = parse_args()
 
+    mlflow_module = None
+    mlflow_run = None
+    if args.enable_mlflow:
+        try:
+            import mlflow as _mlflow  # type: ignore
+
+            mlflow_module = _mlflow
+        except ImportError as exc:
+            raise ImportError(
+                "MLflow is not installed. Install it with: pip install mlflow"
+            ) from exc
+
+        if args.mlflow_tracking_uri:
+            mlflow_module.set_tracking_uri(args.mlflow_tracking_uri)
+        mlflow_module.set_experiment(args.mlflow_experiment)
+
+        mlflow_run = mlflow_module.start_run(
+            run_name=args.mlflow_run_name if args.mlflow_run_name else None
+        )
+
     tf.keras.utils.set_random_seed(args.seed)
     np.random.seed(args.seed)
 
@@ -88,10 +152,47 @@ def main() -> None:
     image_size = (args.image_size, args.image_size)
     output_dir = Path(args.output_dir)
     ensure_dir(output_dir)
-    ensure_dir(output_dir / "models")
-    ensure_dir(output_dir / "plots")
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_label = args.mlflow_run_name.strip() if args.mlflow_run_name else "run"
+    if mlflow_run is not None:
+        run_label = mlflow_run.info.run_id
+
+    run_dir = output_dir / "runs" / f"{timestamp}_{run_label}"
+    models_dir = run_dir / "models"
+    plots_dir = run_dir / "plots"
+    ensure_dir(models_dir)
+    ensure_dir(plots_dir)
 
     split = prepare_splits(data_root=args.data_root, val_ratio=0.1, test_ratio=0.1, seed=args.seed)
+
+    if mlflow_module is not None:
+        mlflow_module.log_params(
+            {
+                "data_root": args.data_root,
+                "output_dir": str(output_dir),
+                "run_dir": str(run_dir),
+                "image_size": args.image_size,
+                "channels": args.channels,
+                "batch_size": args.batch_size,
+                "epochs": args.epochs,
+                "latent_dim_ae": args.latent_dim_ae,
+                "latent_dim_vae": args.latent_dim_vae,
+                "beta": args.beta,
+                "denoise_noise": args.denoise_noise,
+                "seed": args.seed,
+                "jit_compile": args.jit_compile,
+                "memory_growth": args.memory_growth,
+            }
+        )
+        mlflow_module.log_params(
+            {
+                "num_classes": len(split.class_names),
+                "num_train": len(split.train_paths),
+                "num_val": len(split.val_paths),
+                "num_test": len(split.test_paths),
+            }
+        )
 
     train_ds = build_autoencoder_dataset(
         split.train_paths,
@@ -147,7 +248,12 @@ def main() -> None:
     ae_test_metrics = ae.evaluate(test_ds, return_dict=True, verbose=0)
     print("AE test metrics:", ae_test_metrics)
 
-    ae.save_weights(output_dir / "models" / "ae.weights.h5")
+    if mlflow_module is not None:
+        _log_history_metrics(mlflow_module, "ae", ae_history.history)
+        for metric_name, metric_value in ae_test_metrics.items():
+            mlflow_module.log_metric(f"ae_test_{metric_name}", float(metric_value))
+
+    ae.save_weights(models_dir / "ae.weights.h5")
 
     vae = VariationalAutoEncoder(
         input_shape=input_shape,
@@ -169,19 +275,24 @@ def main() -> None:
     vae_test_metrics = vae.evaluate(test_ds, return_dict=True, verbose=0)
     print("VAE test metrics:", vae_test_metrics)
 
+    if mlflow_module is not None:
+        _log_history_metrics(mlflow_module, "vae", vae_history.history)
+        for metric_name, metric_value in vae_test_metrics.items():
+            mlflow_module.log_metric(f"vae_test_{metric_name}", float(metric_value))
+
     # With a custom train_step, Keras may not mark the outer subclassed model as built.
     _ = vae(tf.zeros((1, *input_shape), dtype=tf.float32), training=False)
-    vae.save_weights(output_dir / "models" / "vae.weights.h5")
+    vae.save_weights(models_dir / "vae.weights.h5")
 
     save_training_curves(
         ae_history.history,
-        output_path=str(output_dir / "plots" / "ae_training_curves.png"),
+        output_path=str(plots_dir / "ae_training_curves.png"),
         title="Autoencoder",
         include_kl=False,
     )
     save_training_curves(
         vae_history.history,
-        output_path=str(output_dir / "plots" / "vae_training_curves.png"),
+        output_path=str(plots_dir / "vae_training_curves.png"),
         title="Variational Autoencoder",
         include_kl=True,
     )
@@ -189,33 +300,33 @@ def main() -> None:
     save_reconstructions(
         ae,
         val_ds,
-        output_path=str(output_dir / "plots" / "ae_reconstructions.png"),
+        output_path=str(plots_dir / "ae_reconstructions.png"),
         title="AE Reconstructions (Clean)",
     )
     save_reconstructions(
         vae,
         val_ds,
-        output_path=str(output_dir / "plots" / "vae_reconstructions.png"),
+        output_path=str(plots_dir / "vae_reconstructions.png"),
         title="VAE Reconstructions (Clean)",
     )
 
     save_reconstructions(
         ae,
         denoise_val_ds,
-        output_path=str(output_dir / "plots" / "ae_denoising.png"),
+        output_path=str(plots_dir / "ae_denoising.png"),
         title="AE Denoising",
     )
     save_reconstructions(
         vae,
         denoise_val_ds,
-        output_path=str(output_dir / "plots" / "vae_denoising.png"),
+        output_path=str(plots_dir / "vae_denoising.png"),
         title="VAE Denoising",
     )
 
     generated = vae.sample(num_samples=32)
     save_generated_samples(
         generated,
-        output_path=str(output_dir / "plots" / "vae_generated_samples.png"),
+        output_path=str(plots_dir / "vae_generated_samples.png"),
         title="VAE Generated Samples",
     )
 
@@ -234,18 +345,25 @@ def main() -> None:
         ae_latent,
         embed_labels,
         class_names=split.class_names,
-        output_path=str(output_dir / "plots" / "ae_latent_scatter.png"),
+        output_path=str(plots_dir / "ae_latent_scatter.png"),
         title="AE Latent Space (2D PCA Projection)",
     )
     save_latent_scatter(
         vae_latent,
         embed_labels,
         class_names=split.class_names,
-        output_path=str(output_dir / "plots" / "vae_latent_scatter.png"),
+        output_path=str(plots_dir / "vae_latent_scatter.png"),
         title="VAE Latent Space (2D PCA Projection)",
     )
 
-    print("All artifacts saved under:", output_dir.resolve())
+    if mlflow_module is not None:
+        mlflow_module.log_artifacts(str(models_dir), artifact_path=f"{run_dir.name}/models")
+        mlflow_module.log_artifacts(str(plots_dir), artifact_path=f"{run_dir.name}/plots")
+
+    print("All artifacts saved under:", run_dir.resolve())
+
+    if mlflow_run is not None:
+        mlflow_module.end_run()
 
 
 if __name__ == "__main__":
