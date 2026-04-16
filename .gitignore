@@ -1,3 +1,7 @@
 \data
 \models
 mlruns/
+outputs/
+mlflow.db
+My_Solution/
+My_Solution.zip
