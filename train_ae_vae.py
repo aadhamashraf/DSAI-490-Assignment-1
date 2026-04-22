@@ -13,6 +13,7 @@ import tensorflow as tf
 from models.auto_encoder import AutoEncoder
 from models.variatonal_auto_encoder import VariationalAutoEncoder
 from utils.data_pipeline import (
+    SplitData,
     build_autoencoder_dataset,
     build_embedding_dataset,
     prepare_splits,
@@ -34,6 +35,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--channels", type=int, default=1, choices=[1, 3], help="Image channels.")
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size.")
     parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs.")
+    parser.add_argument(
+        "--early_stopping",
+        action="store_true",
+        help="Enable EarlyStopping on validation loss.",
+    )
+    parser.add_argument(
+        "--early_stopping_patience",
+        type=int,
+        default=5,
+        help="Patience (epochs) for EarlyStopping.",
+    )
+    parser.add_argument(
+        "--early_stopping_min_delta",
+        type=float,
+        default=1e-4,
+        help="Minimum val_loss improvement to reset patience.",
+    )
+    parser.add_argument(
+        "--restore_best_weights",
+        action="store_true",
+        help="Restore best model weights when EarlyStopping stops training.",
+    )
     parser.add_argument("--latent_dim_ae", type=int, default=32, help="Latent size for AE.")
     parser.add_argument("--latent_dim_vae", type=int, default=16, help="Latent size for VAE.")
     parser.add_argument("--beta", type=float, default=1.0, help="Beta coefficient for VAE KL term.")
@@ -71,6 +94,11 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="",
         help="Optional MLflow run name.",
+    )
+    parser.add_argument(
+        "--separate_by_region",
+        action="store_true",
+        help="Train one AE/VAE pair per anatomical region instead of a single model on all regions.",
     )
     return parser.parse_args()
 
@@ -118,6 +146,234 @@ def build_latent_arrays(
     return ae_array, vae_array, labels_array
 
 
+def _subset_split_by_label(split: SplitData, label_index: int, region_name: str) -> SplitData:
+    def pick(paths: list[str], labels: list[int]) -> tuple[list[str], list[int]]:
+        selected_paths = [p for p, y in zip(paths, labels) if y == label_index]
+        selected_labels = [0 for _ in selected_paths]
+        return selected_paths, selected_labels
+
+    train_paths, train_labels = pick(split.train_paths, split.train_labels)
+    val_paths, val_labels = pick(split.val_paths, split.val_labels)
+    test_paths, test_labels = pick(split.test_paths, split.test_labels)
+
+    return SplitData(
+        train_paths=train_paths,
+        train_labels=train_labels,
+        val_paths=val_paths,
+        val_labels=val_labels,
+        test_paths=test_paths,
+        test_labels=test_labels,
+        class_names=[region_name],
+    )
+
+
+def _train_for_split(
+    split: SplitData,
+    args: argparse.Namespace,
+    models_dir: Path,
+    plots_dir: Path,
+    image_size: tuple[int, int],
+    input_shape: tuple[int, int, int],
+    split_tag: str,
+    mlflow_module: Any | None,
+) -> None:
+    if not split.train_paths:
+        print(f"Skipping {split_tag}: no training samples found.")
+        return
+
+    if not split.val_paths:
+        print(f"{split_tag}: validation split is empty, reusing training split for validation artifacts.")
+        split = SplitData(
+            train_paths=split.train_paths,
+            train_labels=split.train_labels,
+            val_paths=split.train_paths,
+            val_labels=split.train_labels,
+            test_paths=split.test_paths,
+            test_labels=split.test_labels,
+            class_names=split.class_names,
+        )
+
+    train_ds = build_autoencoder_dataset(
+        split.train_paths,
+        batch_size=args.batch_size,
+        image_size=image_size,
+        channels=args.channels,
+        shuffle=True,
+        noise_stddev=0.0,
+    )
+    val_ds = build_autoencoder_dataset(
+        split.val_paths,
+        batch_size=args.batch_size,
+        image_size=image_size,
+        channels=args.channels,
+        shuffle=False,
+        noise_stddev=0.0,
+    )
+    denoise_val_ds = build_autoencoder_dataset(
+        split.val_paths,
+        batch_size=args.batch_size,
+        image_size=image_size,
+        channels=args.channels,
+        shuffle=False,
+        noise_stddev=args.denoise_noise,
+    )
+
+    test_paths = split.test_paths if split.test_paths else split.val_paths
+    test_ds = build_autoencoder_dataset(
+        test_paths,
+        batch_size=args.batch_size,
+        image_size=image_size,
+        channels=args.channels,
+        shuffle=False,
+        noise_stddev=0.0,
+    )
+
+    ae = AutoEncoder(input_shape=input_shape, latent_dim=args.latent_dim_ae)
+    ae.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
+        loss=tf.keras.losses.MeanSquaredError(),
+        metrics=[tf.keras.metrics.MeanAbsoluteError(name="mae")],
+        jit_compile=args.jit_compile,
+    )
+
+    callbacks: list[tf.keras.callbacks.Callback] = []
+    if args.early_stopping:
+        callbacks.append(
+            tf.keras.callbacks.EarlyStopping(
+                monitor="val_loss",
+                patience=args.early_stopping_patience,
+                min_delta=args.early_stopping_min_delta,
+                mode="min",
+                restore_best_weights=args.restore_best_weights,
+                verbose=1,
+            )
+        )
+
+    ae_history = ae.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=args.epochs,
+        callbacks=callbacks,
+        verbose=1,
+    )
+
+    ae_test_metrics = ae.evaluate(test_ds, return_dict=True, verbose=0)
+    print(f"{split_tag} AE test metrics:", ae_test_metrics)
+
+    if mlflow_module is not None:
+        _log_history_metrics(mlflow_module, f"{split_tag}_ae", ae_history.history)
+        for metric_name, metric_value in ae_test_metrics.items():
+            mlflow_module.log_metric(f"{split_tag}_ae_test_{metric_name}", float(metric_value))
+
+    ae.save_weights(models_dir / "ae.weights.h5")
+
+    vae = VariationalAutoEncoder(
+        input_shape=input_shape,
+        latent_dim=args.latent_dim_vae,
+        beta=args.beta,
+    )
+    vae.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
+        jit_compile=args.jit_compile,
+    )
+
+    vae_history = vae.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=args.epochs,
+        callbacks=callbacks,
+        verbose=1,
+    )
+
+    vae_test_metrics = vae.evaluate(test_ds, return_dict=True, verbose=0)
+    print(f"{split_tag} VAE test metrics:", vae_test_metrics)
+
+    if mlflow_module is not None:
+        _log_history_metrics(mlflow_module, f"{split_tag}_vae", vae_history.history)
+        for metric_name, metric_value in vae_test_metrics.items():
+            mlflow_module.log_metric(f"{split_tag}_vae_test_{metric_name}", float(metric_value))
+
+    # With a custom train_step, Keras may not mark the outer subclassed model as built.
+    _ = vae(tf.zeros((1, *input_shape), dtype=tf.float32), training=False)
+    vae.save_weights(models_dir / "vae.weights.h5")
+
+    save_training_curves(
+        ae_history.history,
+        output_path=str(plots_dir / "ae_training_curves.png"),
+        title=f"Autoencoder ({split_tag})",
+        include_kl=False,
+    )
+    save_training_curves(
+        vae_history.history,
+        output_path=str(plots_dir / "vae_training_curves.png"),
+        title=f"Variational Autoencoder ({split_tag})",
+        include_kl=True,
+    )
+
+    save_reconstructions(
+        ae,
+        val_ds,
+        output_path=str(plots_dir / "ae_reconstructions.png"),
+        title=f"AE Reconstructions ({split_tag})",
+    )
+    save_reconstructions(
+        vae,
+        val_ds,
+        output_path=str(plots_dir / "vae_reconstructions.png"),
+        title=f"VAE Reconstructions ({split_tag})",
+    )
+
+    save_reconstructions(
+        ae,
+        denoise_val_ds,
+        output_path=str(plots_dir / "ae_denoising.png"),
+        title=f"AE Denoising ({split_tag})",
+    )
+    save_reconstructions(
+        vae,
+        denoise_val_ds,
+        output_path=str(plots_dir / "vae_denoising.png"),
+        title=f"VAE Denoising ({split_tag})",
+    )
+
+    generated = vae.sample(num_samples=32)
+    save_generated_samples(
+        generated,
+        output_path=str(plots_dir / "vae_generated_samples.png"),
+        title=f"VAE Generated Samples ({split_tag})",
+    )
+
+    max_embed = min(2000, len(split.val_paths))
+    embed_ds = build_embedding_dataset(
+        paths=split.val_paths[:max_embed],
+        labels=split.val_labels[:max_embed],
+        batch_size=args.batch_size,
+        image_size=image_size,
+        channels=args.channels,
+    )
+
+    ae_latent, vae_latent, embed_labels = build_latent_arrays(ae, vae, embed_ds)
+
+    save_latent_scatter(
+        ae_latent,
+        embed_labels,
+        class_names=split.class_names,
+        output_path=str(plots_dir / "ae_latent_scatter.png"),
+        title=f"AE Latent Space ({split_tag})",
+    )
+    save_latent_scatter(
+        vae_latent,
+        embed_labels,
+        class_names=split.class_names,
+        output_path=str(plots_dir / "vae_latent_scatter.png"),
+        title=f"VAE Latent Space ({split_tag})",
+    )
+
+    if mlflow_module is not None:
+        mlflow_module.log_artifacts(str(models_dir), artifact_path=f"{split_tag}/models")
+        mlflow_module.log_artifacts(str(plots_dir), artifact_path=f"{split_tag}/plots")
+
+
 def main() -> None:
     args = parse_args()
 
@@ -159,10 +415,7 @@ def main() -> None:
         run_label = mlflow_run.info.run_id
 
     run_dir = output_dir / "runs" / f"{timestamp}_{run_label}"
-    models_dir = run_dir / "models"
-    plots_dir = run_dir / "plots"
-    ensure_dir(models_dir)
-    ensure_dir(plots_dir)
+    ensure_dir(run_dir)
 
     split = prepare_splits(data_root=args.data_root, val_ratio=0.1, test_ratio=0.1, seed=args.seed)
 
@@ -176,6 +429,10 @@ def main() -> None:
                 "channels": args.channels,
                 "batch_size": args.batch_size,
                 "epochs": args.epochs,
+                "early_stopping": args.early_stopping,
+                "early_stopping_patience": args.early_stopping_patience,
+                "early_stopping_min_delta": args.early_stopping_min_delta,
+                "restore_best_weights": args.restore_best_weights,
                 "latent_dim_ae": args.latent_dim_ae,
                 "latent_dim_vae": args.latent_dim_vae,
                 "beta": args.beta,
@@ -183,6 +440,7 @@ def main() -> None:
                 "seed": args.seed,
                 "jit_compile": args.jit_compile,
                 "memory_growth": args.memory_growth,
+                "separate_by_region": args.separate_by_region,
             }
         )
         mlflow_module.log_params(
@@ -194,171 +452,55 @@ def main() -> None:
             }
         )
 
-    train_ds = build_autoencoder_dataset(
-        split.train_paths,
-        batch_size=args.batch_size,
-        image_size=image_size,
-        channels=args.channels,
-        shuffle=True,
-        noise_stddev=0.0,
-    )
-    val_ds = build_autoencoder_dataset(
-        split.val_paths,
-        batch_size=args.batch_size,
-        image_size=image_size,
-        channels=args.channels,
-        shuffle=False,
-        noise_stddev=0.0,
-    )
-    test_ds = build_autoencoder_dataset(
-        split.test_paths,
-        batch_size=args.batch_size,
-        image_size=image_size,
-        channels=args.channels,
-        shuffle=False,
-        noise_stddev=0.0,
-    )
-
-    denoise_val_ds = build_autoencoder_dataset(
-        split.val_paths,
-        batch_size=args.batch_size,
-        image_size=image_size,
-        channels=args.channels,
-        shuffle=False,
-        noise_stddev=args.denoise_noise,
-    )
-
     input_shape = (args.image_size, args.image_size, args.channels)
 
-    ae = AutoEncoder(input_shape=input_shape, latent_dim=args.latent_dim_ae)
-    ae.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
-        loss=tf.keras.losses.MeanSquaredError(),
-        metrics=[tf.keras.metrics.MeanAbsoluteError(name="mae")],
-        jit_compile=args.jit_compile,
-    )
+    if args.separate_by_region:
+        regions_root = run_dir / "regions"
+        ensure_dir(regions_root)
+        for region_index, region_name in enumerate(split.class_names):
+            region_split = _subset_split_by_label(split, label_index=region_index, region_name=region_name)
+            region_dir = regions_root / region_name
+            models_dir = region_dir / "models"
+            plots_dir = region_dir / "plots"
+            ensure_dir(models_dir)
+            ensure_dir(plots_dir)
 
-    ae_history = ae.fit(
-        train_ds,
-        validation_data=val_ds,
-        epochs=args.epochs,
-        verbose=1,
-    )
+            if mlflow_module is not None:
+                mlflow_module.log_params(
+                    {
+                        f"region_{region_name}_num_train": len(region_split.train_paths),
+                        f"region_{region_name}_num_val": len(region_split.val_paths),
+                        f"region_{region_name}_num_test": len(region_split.test_paths),
+                    }
+                )
 
-    ae_test_metrics = ae.evaluate(test_ds, return_dict=True, verbose=0)
-    print("AE test metrics:", ae_test_metrics)
+            print(f"\n=== Training region: {region_name} ===")
+            _train_for_split(
+                split=region_split,
+                args=args,
+                models_dir=models_dir,
+                plots_dir=plots_dir,
+                image_size=image_size,
+                input_shape=input_shape,
+                split_tag=f"region_{region_name}",
+                mlflow_module=mlflow_module,
+            )
+    else:
+        models_dir = run_dir / "models"
+        plots_dir = run_dir / "plots"
+        ensure_dir(models_dir)
+        ensure_dir(plots_dir)
 
-    if mlflow_module is not None:
-        _log_history_metrics(mlflow_module, "ae", ae_history.history)
-        for metric_name, metric_value in ae_test_metrics.items():
-            mlflow_module.log_metric(f"ae_test_{metric_name}", float(metric_value))
-
-    ae.save_weights(models_dir / "ae.weights.h5")
-
-    vae = VariationalAutoEncoder(
-        input_shape=input_shape,
-        latent_dim=args.latent_dim_vae,
-        beta=args.beta,
-    )
-    vae.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
-        jit_compile=args.jit_compile,
-    )
-
-    vae_history = vae.fit(
-        train_ds,
-        validation_data=val_ds,
-        epochs=args.epochs,
-        verbose=1,
-    )
-
-    vae_test_metrics = vae.evaluate(test_ds, return_dict=True, verbose=0)
-    print("VAE test metrics:", vae_test_metrics)
-
-    if mlflow_module is not None:
-        _log_history_metrics(mlflow_module, "vae", vae_history.history)
-        for metric_name, metric_value in vae_test_metrics.items():
-            mlflow_module.log_metric(f"vae_test_{metric_name}", float(metric_value))
-
-    # With a custom train_step, Keras may not mark the outer subclassed model as built.
-    _ = vae(tf.zeros((1, *input_shape), dtype=tf.float32), training=False)
-    vae.save_weights(models_dir / "vae.weights.h5")
-
-    save_training_curves(
-        ae_history.history,
-        output_path=str(plots_dir / "ae_training_curves.png"),
-        title="Autoencoder",
-        include_kl=False,
-    )
-    save_training_curves(
-        vae_history.history,
-        output_path=str(plots_dir / "vae_training_curves.png"),
-        title="Variational Autoencoder",
-        include_kl=True,
-    )
-
-    save_reconstructions(
-        ae,
-        val_ds,
-        output_path=str(plots_dir / "ae_reconstructions.png"),
-        title="AE Reconstructions (Clean)",
-    )
-    save_reconstructions(
-        vae,
-        val_ds,
-        output_path=str(plots_dir / "vae_reconstructions.png"),
-        title="VAE Reconstructions (Clean)",
-    )
-
-    save_reconstructions(
-        ae,
-        denoise_val_ds,
-        output_path=str(plots_dir / "ae_denoising.png"),
-        title="AE Denoising",
-    )
-    save_reconstructions(
-        vae,
-        denoise_val_ds,
-        output_path=str(plots_dir / "vae_denoising.png"),
-        title="VAE Denoising",
-    )
-
-    generated = vae.sample(num_samples=32)
-    save_generated_samples(
-        generated,
-        output_path=str(plots_dir / "vae_generated_samples.png"),
-        title="VAE Generated Samples",
-    )
-
-    max_embed = min(2000, len(split.val_paths))
-    embed_ds = build_embedding_dataset(
-        paths=split.val_paths[:max_embed],
-        labels=split.val_labels[:max_embed],
-        batch_size=args.batch_size,
-        image_size=image_size,
-        channels=args.channels,
-    )
-
-    ae_latent, vae_latent, embed_labels = build_latent_arrays(ae, vae, embed_ds)
-
-    save_latent_scatter(
-        ae_latent,
-        embed_labels,
-        class_names=split.class_names,
-        output_path=str(plots_dir / "ae_latent_scatter.png"),
-        title="AE Latent Space (2D PCA Projection)",
-    )
-    save_latent_scatter(
-        vae_latent,
-        embed_labels,
-        class_names=split.class_names,
-        output_path=str(plots_dir / "vae_latent_scatter.png"),
-        title="VAE Latent Space (2D PCA Projection)",
-    )
-
-    if mlflow_module is not None:
-        mlflow_module.log_artifacts(str(models_dir), artifact_path=f"{run_dir.name}/models")
-        mlflow_module.log_artifacts(str(plots_dir), artifact_path=f"{run_dir.name}/plots")
+        _train_for_split(
+            split=split,
+            args=args,
+            models_dir=models_dir,
+            plots_dir=plots_dir,
+            image_size=image_size,
+            input_shape=input_shape,
+            split_tag="all_regions",
+            mlflow_module=mlflow_module,
+        )
 
     print("All artifacts saved under:", run_dir.resolve())
 

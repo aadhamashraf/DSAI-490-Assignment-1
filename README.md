@@ -47,7 +47,27 @@ python train_ae_vae.py \
   --channels 1 \
   --batch_size 64 \
   --epochs 20 \
-  --memory_growth
+  --memory_growth \
+  --early_stopping \
+  --early_stopping_patience 5 \
+  --early_stopping_min_delta 1e-4 \
+  --restore_best_weights
+
+Train separate AE/VAE pairs per anatomical region:
+
+python train_ae_vae.py \
+  --data_root data \
+  --output_dir outputs \
+  --image_size 128 \
+  --channels 1 \
+  --batch_size 64 \
+  --epochs 20 \
+  --memory_growth \
+  --early_stopping \
+  --early_stopping_patience 5 \
+  --early_stopping_min_delta 1e-4 \
+  --restore_best_weights \
+  --separate_by_region
 
 Optional (faster steady-state, but may print extra XLA/cuDNN autotuning warnings):
 
@@ -79,6 +99,7 @@ What gets logged:
 - Dataset split sizes
 - AE and VAE per-epoch metrics
 - AE and VAE test metrics
+- Early stopping configuration parameters
 - Saved model weights and plots as artifacts
 
 ## Google Drive / Colab Run
@@ -105,3 +126,9 @@ After training, artifacts are saved under a unique run directory to avoid overwr
 - outputs/runs/<timestamp>_<run_name_or_run_id>/plots/vae_generated_samples.png
 - outputs/runs/<timestamp>_<run_name_or_run_id>/plots/ae_latent_scatter.png
 - outputs/runs/<timestamp>_<run_name_or_run_id>/plots/vae_latent_scatter.png
+
+When using --separate_by_region, artifacts are grouped by region:
+
+- outputs/runs/<timestamp>_<run_name_or_run_id>/regions/<RegionName>/models/ae.weights.h5
+- outputs/runs/<timestamp>_<run_name_or_run_id>/regions/<RegionName>/models/vae.weights.h5
+- outputs/runs/<timestamp>_<run_name_or_run_id>/regions/<RegionName>/plots/*.png
